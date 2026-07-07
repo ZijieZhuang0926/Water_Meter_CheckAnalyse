@@ -42,7 +42,8 @@ class HardRuleChecker:
         
     def check(self, today_readings: List[float], today_date: str,
               history_readings: List[Tuple[str, float]],
-              baseline_reading: Optional[float] = None) -> Dict[str, Any]:
+              baseline_reading: Optional[float] = None,
+              baseline_date: Optional[str] = None) -> Dict[str, Any]:
         if len(today_readings) == 0:
             return self._build_result(False, 'data_insufficient', 1.0, '今日无读数')
 
@@ -60,8 +61,7 @@ class HardRuleChecker:
 
         if baseline_reading is not None:
             prev_reading = baseline_reading
-            latest_history = history_df.iloc[-1]
-            prev_date = latest_history['date']
+            prev_date = pd.to_datetime(baseline_date) if baseline_date else history_df.iloc[-1]['date']
         else:
             latest_history = history_df.iloc[-1]
             prev_date = latest_history['date']

@@ -13,19 +13,20 @@ from consumption_predictor import ConsumptionPredictor
 
 class WaterMeterAnomalyDetector:
     """
-    水表读数异常检测器（统一版）
+    水表读数异常检测器（管道版）
     
-    架构：
+    架构：三层管道，逐层过滤
     ┌─────────────────────────────────────────────────────────┐
-    │  第0层：可信基线查找 (_find_trusted_baseline)            │
-    │  - 多阶段异常检测，跳过异常读数，找到最近可信基线         │
+    │  第0层：数据清洗管道 (_clean_history)                    │
+    │  - 用hard_rules逐条扫描历史，标记异常读数                 │
+    │  - 输出：清洗后的历史数据 + 可信基线                      │
     ├─────────────────────────────────────────────────────────┤
     │  第一层：硬规则检测 (HardRuleChecker)                    │
-    │  - 读数回退、字轮进位、位数突变、物理上限等              │
+    │  - 用清洗后的基线检测今日读数                             │
     │  - 违反 → 直接判定异常                                   │
     ├─────────────────────────────────────────────────────────┤
     │  第二层：ML预测检测 (ConsumptionPredictor)               │
-    │  - 同星期基线 + EMA趋势 + 节假日调整                     │
+    │  - 接收已清洗的历史数据做预测                             │
     │  - 实际增量超出预测区间 → 异常                            │
     └─────────────────────────────────────────────────────────┘
     
@@ -60,19 +61,21 @@ class WaterMeterAnomalyDetector:
         }
         self.predictor = ConsumptionPredictor(predictor_config)
 
-    def _find_trusted_baseline(self, history_readings: List[Tuple[str, float]]) -> Optional[Tuple[str, float]]:
+    def _clean_history(self, history_readings: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], Optional[Tuple[str, float]]]:
         """
-        查找可信基线（多阶段异常检测）
+        数据清洗管道：用hard_rules扫描历史，标记异常读数
         
-        步骤：
-        1. 标记负增量和字轮异常
-        2. 检测增量异常（MAD过滤）
-        3. 按位数分组检测读数偏差异常
-        4. 检测位数异常（众数一致性）
-        5. 返回最近的正常读数作为基线
+        返回：(清洗后的历史数据, 可信基线)
+        
+        清洗规则：
+        1. 负增量 → 异常
+        2. 字轮进位异常 → 异常
+        3. 增量超出MAD阈值 → 异常
+        4. 读数偏离正常组中位数太远 → 异常
+        5. 位数异常 → 异常
         """
         if not history_readings:
-            return None
+            return [], None
 
         history_df = pd.DataFrame(history_readings, columns=['date', 'reading'])
         history_df['date'] = pd.to_datetime(history_df['date'])
@@ -93,7 +96,8 @@ class WaterMeterAnomalyDetector:
             current_row = history_df.iloc[i]
             prev_row = history_df.iloc[i - 1]
             
-            wheel_result = self.hard_rules._check_wheel_digit_anomaly(prev_row['reading'], current_row['reading'], current_row['increment'] * current_row['date_diff'])
+            total_increment = current_row['reading'] - prev_row['reading']
+            wheel_result = self.hard_rules._check_wheel_digit_anomaly(prev_row['reading'], current_row['reading'], total_increment)
             has_wheel_anomaly = wheel_result['is_anomaly']
             has_negative_increment = current_row['increment'] < 0
             
@@ -108,12 +112,9 @@ class WaterMeterAnomalyDetector:
             anomaly_threshold = median_inc + 5 * mad
         else:
             anomaly_threshold = float('inf')
-
-        for i in range(1, len(history_df)):
-            if history_df.loc[i, 'is_anomaly']:
-                continue
-            if history_df.loc[i, 'increment'] > anomaly_threshold:
-                history_df.loc[i, 'is_anomaly'] = True
+            for i in range(1, len(history_df)):
+                if not history_df.loc[i, 'is_anomaly'] and history_df.loc[i, 'increment'] > anomaly_threshold:
+                    history_df.loc[i, 'is_anomaly'] = True
 
         digit_groups = history_df.groupby('digits')
         max_group_digits = None
@@ -134,12 +135,9 @@ class WaterMeterAnomalyDetector:
             for i in range(len(history_df)):
                 if history_df.iloc[i]['is_anomaly']:
                     continue
-                
-                if history_df.iloc[i]['digits'] != max_group_digits:
-                    continue
-                
-                if abs(history_df.iloc[i]['reading'] - group_median) > reading_threshold:
-                    history_df.loc[history_df.index[i], 'is_anomaly'] = True
+                if history_df.iloc[i]['digits'] == max_group_digits:
+                    if abs(history_df.iloc[i]['reading'] - group_median) > reading_threshold:
+                        history_df.loc[history_df.index[i], 'is_anomaly'] = True
 
         normal_df = history_df[~history_df['is_anomaly']]
         digit_counts = Counter(normal_df['digits'].values)
@@ -161,17 +159,10 @@ class WaterMeterAnomalyDetector:
                 continue
             
             has_digit_anomaly = False
-            if expected_digits is not None:
-                current_digits = current_row['digits']
-                
-                if current_digits != expected_digits:
-                    valid_prev_reading = prev_normal_reading if prev_normal_reading is not None else current_row['reading']
-                    
-                    if current_digits == expected_digits + 1 and str(int(valid_prev_reading)).endswith('9'):
-                        has_digit_anomaly = False
-                    elif current_digits == expected_digits - 1 and str(int(current_row['reading'])).endswith('0'):
-                        has_digit_anomaly = False
-                    else:
+            if expected_digits is not None and current_row['digits'] != expected_digits:
+                valid_prev_reading = prev_normal_reading if prev_normal_reading is not None else current_row['reading']
+                if not (current_row['digits'] == expected_digits + 1 and str(int(valid_prev_reading)).endswith('9')):
+                    if not (current_row['digits'] == expected_digits - 1 and str(int(current_row['reading'])).endswith('0')):
                         has_digit_anomaly = True
             
             if has_digit_anomaly:
@@ -179,13 +170,18 @@ class WaterMeterAnomalyDetector:
                 if prev_normal_reading is not None:
                     prev_normal_reading = None
 
-        for i in range(len(history_df) - 1, 0, -1):
-            if not history_df.iloc[i]['is_anomaly']:
-                return (history_df.iloc[i]['date'].strftime('%Y-%m-%d'), float(history_df.iloc[i]['reading']))
+        filtered_df = history_df[~history_df['is_anomaly']]
+        filtered_readings = [
+            (row['date'].strftime('%Y-%m-%d'), float(row['reading']))
+            for _, row in filtered_df.iterrows()
+        ]
 
-        if len(history_df) > 0:
-            return (history_df.iloc[0]['date'].strftime('%Y-%m-%d'), float(history_df.iloc[0]['reading']))
-        return None
+        baseline = None
+        if len(filtered_df) > 0:
+            latest_row = filtered_df.iloc[-1]
+            baseline = (latest_row['date'].strftime('%Y-%m-%d'), float(latest_row['reading']))
+
+        return filtered_readings, baseline
 
     def check(self, meter_id: str, today_readings: List[float], today_date: str,
               history_readings: List[Tuple[str, float]]) -> Dict[str, Any]:
@@ -198,14 +194,17 @@ class WaterMeterAnomalyDetector:
             'today_reading_count': len(today_readings),
         }
 
-        baseline_result = self._find_trusted_baseline(history_readings)
+        filtered_readings, baseline = self._clean_history(history_readings)
+        metadata['filtered_history_count'] = len(filtered_readings)
+        
         baseline_reading = None
-        if baseline_result:
-            baseline_date, baseline_reading = baseline_result
+        baseline_date = None
+        if baseline:
+            baseline_date, baseline_reading = baseline
             metadata['baseline_date'] = baseline_date
             metadata['baseline_reading'] = baseline_reading
 
-        hard_result = self.hard_rules.check(today_readings, today_date, history_readings, baseline_reading)
+        hard_result = self.hard_rules.check(today_readings, today_date, filtered_readings, baseline_reading, baseline_date)
 
         if not hard_result['is_passed']:
             metadata['violation_type'] = hard_result['violation_type']
@@ -219,23 +218,19 @@ class WaterMeterAnomalyDetector:
             return self._build_result(meter_id, today_date, today_reading, True,
                                       'normal', 0.0, '首次上报，建立基线', metadata)
 
-        history_days = len(history_readings)
+        history_days = len(filtered_readings)
         detection_stage = 1 if history_days >= self.predictor.min_history_days else 0
         metadata['detection_stage'] = detection_stage
         metadata['stage_name'] = self.DETECTION_STAGES[detection_stage]['name']
 
         if detection_stage == 1:
-            prediction = self.predictor.predict(today_date, history_readings, baseline_reading)
+            prediction = self.predictor.predict(today_date, filtered_readings, baseline_reading)
             
             if prediction['predicted_value'] is not None:
                 metadata['prediction'] = prediction
 
-                history_df = pd.DataFrame(history_readings, columns=['date', 'reading'])
-                history_df['date'] = pd.to_datetime(history_df['date'])
-                history_df = history_df.sort_values('date').reset_index(drop=True)
-                
-                prev_reading = baseline_reading if baseline_reading else float(history_df.iloc[-1]['reading'])
-                date_diff = (pd.to_datetime(today_date) - pd.to_datetime(baseline_result[0])).days if baseline_result else (pd.to_datetime(today_date) - history_df.iloc[-1]['date']).days
+                prev_reading = baseline_reading if baseline_reading else float(filtered_readings[-1][1])
+                date_diff = (pd.to_datetime(today_date) - pd.to_datetime(baseline[0])).days if baseline else 1
                 
                 today_increment = (today_reading - prev_reading) / date_diff
 

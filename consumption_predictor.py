@@ -9,11 +9,12 @@ class ConsumptionPredictor:
     水表日用量预测器（整数数据优化版）
     
     核心改进：
-    1. 周期性检测：用众数一致性比率替代F-ratio，避免整数数据组内方差为0的问题,有可能有的表读数一直稳定
+    1. 周期性检测：用众数一致性比率替代F-ratio，避免整数数据组内方差为0的问题
     2. MAD下限：设为0.5（半个整数单位），防止整数数据MAD=0导致统计失效
-    3. 历史数据过滤：MAD预过滤，剔除偏差>5×MAD的异常历史点，防止OCR污染
-    4. 趋势预测：用EMA替代线性外推，累计值差分不应线性增长
-    5. 整数量化补偿：预测区间上下界各扩展±0.5，确保与整数增量比较在同一空间
+    3. 趋势预测：用EMA替代线性外推，累计值差分不应线性增长
+    4. 整数量化补偿：预测区间上下界各扩展±0.5，确保与整数增量比较在同一空间
+    
+    注意：本模块假设输入的history_readings已经经过清洗，不含异常数据
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -26,7 +27,6 @@ class ConsumptionPredictor:
         self.holiday_weight = self.config.get('holiday_weight', 0.1)
         self.mad_floor = self.config.get('mad_floor', 0.5)
         self.ema_alpha = self.config.get('ema_alpha', 0.3)
-        self.outlier_factor = self.config.get('outlier_factor', 5.0)
 
     def predict(self, today_date: str, history_readings: List[Tuple[str, float]],
                 baseline_reading: Optional[float] = None) -> Dict[str, Any]:
@@ -59,13 +59,6 @@ class ConsumptionPredictor:
             return self._build_result(None, None, None, 0.0,
                                       '有效增量数据不足',
                                       {'reason': 'insufficient_valid_data', 'valid_samples': len(history_df)})
-
-        history_df = self._filter_outliers(history_df)
-        #确认历史数据长度   
-        if len(history_df) < 7:
-            return self._build_result(None, None, None, 0.0,
-                                      '过滤异常值后有效数据不足',
-                                      {'reason': 'insufficient_after_filter', 'valid_samples': len(history_df)})
 
         today = pd.to_datetime(today_date)
         today_weekday = today.weekday()
@@ -141,22 +134,6 @@ class ConsumptionPredictor:
         return self._build_result(round(weighted_prediction, 2), round(lower_bound, 2),
                                   round(upper_bound, 2), round(overall_confidence, 2),
                                   '预测完成', metadata)
-
-    def _filter_outliers(self, history_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        MAD预过滤：剔除偏差>5×MAD的历史增量点，防止OCR错误污染基线
-        """
-        increments = history_df['increment'].values
-        median = np.median(increments)
-        raw_mad = np.median(np.abs(increments - median))
-        mad = max(raw_mad, self.mad_floor)
-
-        threshold = self.outlier_factor * mad
-        mask = np.abs(increments - median) <= threshold
-
-        filtered_df = history_df[mask].copy()
-
-        return filtered_df
 
     def _detect_periodicity_mode(self, history_df: pd.DataFrame) -> float:
         """
